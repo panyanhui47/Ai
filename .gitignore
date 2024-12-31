@@ -1,0 +1,36 @@
+# 忽略日志文件
+*.log
+logs/
+
+# 忽略 IDE 配置文件
+.vscode/
+.idea/
+
+# 忽略操作系统生成的文件
+.DS_Store
+Thumbs.db
+
+# 忽略 temp 目录
+temp/
+
+# 忽略所有 .log 文件
+*.log
+
+# 忽略所有 .db 文件
+*.db
+
+# 忽略 Python 编译文件
+*.pyc
+*.pyo
+__pycache__/
+
+# 忽略忽略虚拟环境
+venv/
+*/venv/
+
+# 忽略 特定 目录
+build/
+yuce/other/
+
+# 临时忽略
+*.csv
