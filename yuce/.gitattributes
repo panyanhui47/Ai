@@ -1,4 +1,0 @@
-yuce/ETH_USDT_1m_binance_data.csv filter=lfs diff=lfs merge=lfs -text
-yuce/BTC_USDT_1m_binance_data[[:space:]]copy.csv filter=lfs diff=lfs merge=lfs -text
-yuce/ETH_USDT_1m_binance_data[[:space:]]-[[:space:]]副本.csv filter=lfs diff=lfs merge=lfs -text
-yuce/other/ filter=lfs diff=lfs merge=lfs -text

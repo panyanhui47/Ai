@@ -30,7 +30,7 @@ venv/
 
 # 忽略 特定 目录
 build/
-yuce/other/
+预测/other/
 
 # 临时忽略
 *.csv
