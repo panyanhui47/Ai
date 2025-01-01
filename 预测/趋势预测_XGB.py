@@ -7,7 +7,7 @@ import talib
 # from sklearn.linear_model import LogisticRegression, SGDClassifier, PassiveAggressiveClassifier
 # from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve, confusion_matrix, ConfusionMatrixDisplay
 # from sklearn.svm import SVC
-# from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.preprocessing import RobustScaler
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -293,25 +293,55 @@ def generate_labels_and_features(df, window_size=20, train_ratio=0.8):
 
     # 过滤掉无关列
     features = df.drop(columns=['Label', 'PriceChange'], errors='ignore')  # 确保去掉无关列
+
     logger.info(f"特征数据的头几行:\n{features.head()}")
     logger.info(f"特征数据的尾几行:\n{features.tail()}")
     
     logger.info(f"特征数据的NaN数量: {np.sum(np.isnan(features.values))}")
 
+    # =================================================================================
+    # 1. 标准化 K线数据 (Open, High, Low, Close, Volume)
+    kline_columns = ['Open', 'High', 'Low', 'Close', 'Volume']  # K线数据的列
+    kline_data = features[kline_columns]
+
+    # 使用 StandardScaler 对 K线数据进行标准化
+    scaler_kline = StandardScaler()
+    features[kline_columns] = scaler_kline.fit_transform(kline_data)
+
+    # 2. 对技术指标进行 Min-Max 缩放
+    indicator_columns = ['MA50', 'MA200', 'ADX', 'UpperBand', 'MiddleBand', 'LowerBand', 'ATR', 'RSI']
+    indicator_data = features[indicator_columns]
+
+    # 使用 MinMaxScaler 对技术指标数据进行缩放
+    scaler_indicator = MinMaxScaler(feature_range=(0, 1))
+    features[indicator_columns] = scaler_indicator.fit_transform(indicator_data)
+
+    # 将 features 转换为 Pandas DataFrame 并输出前几行
+    features_scaled = pd.DataFrame(features)  # 将标准化后的特征数据转换为 DataFrame
+    # 删除 timestamp 列
+    # features_scaled = features_scaled.drop(columns=['timestamp'], errors='ignore')  # 后期可取时间周期作为特征，而不是时间本身，但索引列默认是不传入模型的
+    # =================================================================================
+
+    logger.info(f"特征数据【处理后】的头几行:\n{features_scaled.head()}")
+    logger.info(f"特征数据【处理后】的尾几行:\n{features_scaled.tail()}")
+    
+    logger.info(f"特征数据【处理后】的NaN数量: {np.sum(np.isnan(features_scaled.values))}")
+
     # 获取滚动窗口数据
     def get_rolling_window_data(data, labels, window_size, train_ratio=0.8):
         X_train, y_train, X_val, y_val = [], [], [], []
-        # for i in range(len(data) - window_size - val_size):
-        #     X_train.append(data[i:i + window_size])  # 训练集
-        #     y_train.append(df['Label'].iloc[i + window_size])  # 对应的标签
-        #     X_val.append(data[i + window_size:i + window_size + val_size])  # 验证集（尾部数据）
-        #     y_val.append(df['Label'].iloc[i + window_size + val_size])  # 验证集的标签
         
         # 假设原始数据是按时间序列顺序排好
         for i in range(len(data) - window_size):
             # 获取当前窗口的特征数据，排除标签列
             X_window = data[i:i + window_size, :]
             y_window = labels[i + window_size]  # 获取当前窗口对应的标签
+
+            # 跟踪输出头两个和末尾两个窗口的数据
+            if i < 2 or i >= len(data) - window_size - 2:
+                X_window_flat = X_window.flatten()  # 将窗口数据展平成一维数组
+                print(f"窗口 {i} 的特征数据: {', '.join(map(str, X_window_flat))}, 标签数据: {y_window}")
+
             # 切分训练集和验证集
             if i < len(data) * train_ratio:  # 判断是训练集还是验证集
                 X_train.append(X_window)  # 将完整的窗口添加到训练集
@@ -323,7 +353,7 @@ def generate_labels_and_features(df, window_size=20, train_ratio=0.8):
         return np.array(X_train), np.array(y_train), np.array(X_val), np.array(y_val)
 
     # 获取特征数据和标签
-    X_train, y_train, X_val, y_val = get_rolling_window_data(features.values, df['Label'].values, window_size, train_ratio)
+    X_train, y_train, X_val, y_val = get_rolling_window_data(features_scaled.values, df['Label'].values, window_size, train_ratio)
 
     logger.info(f"训练特征数据形状: {X_train.shape}")
     logger.info(f"训练标签数据形状: {y_train.shape}")
@@ -436,6 +466,20 @@ def build_model(hp, X, window_size):
 
     return model
 
+def restore_model_from_checkpoint(model, checkpoint_dir):
+    """
+    从断训点恢复模型和优化器的状态
+    :param model: 当前模型
+    :param checkpoint_dir: 断训点的保存目录
+    :return: 恢复后的模型
+    """
+    checkpoint = tf.train.Checkpoint(model=model)
+    latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+    if latest_checkpoint:
+        logger.info(f"恢复模型从：{latest_checkpoint}")
+        checkpoint.restore(latest_checkpoint)
+    return model
+
 def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, batch_size=16):
     """
     使用KerasTuner进行LSTM超参数自动调优
@@ -446,6 +490,9 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
     :param batch_size: 每个批次的样本数
     """
     logger.info("开始执行LSTM自动调参...")
+
+    # 从超参数对象中获取 window_size 的值
+    # window_size = hp.Int('window_size', min_value=10, max_value=100, step=10)
 
     # 准备数据
     X_train, y_train, X_val, y_val = generate_labels_and_features(df, window_size, train_ratio)
@@ -463,7 +510,7 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
     # 使用KerasTuner进行调参
     tuner = kt.Hyperband(
         build_model_partial,  # 使用部分参数化的模型构建函数
-        objective='accuracy',  # 目标是验证集准确率
+        objective='val_loss',  # 目标是验证集准确率
         max_epochs=epochs,
         factor=3,
         hyperband_iterations=3,
@@ -472,21 +519,57 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
     )
     
     # 定义学习率调度器和早期停止回调
-    lr_scheduler = ReduceLROnPlateau(monitor='loss', factor=0.1, patience=10, min_lr=1e-6, verbose=1)
-    early_stopping = EarlyStopping(monitor='accuracy', patience=20, restore_best_weights=True)
+    lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.01, patience=10, min_lr=1e-6, verbose=1)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
 
     # 添加模型检查点回调
     checkpoint = ModelCheckpoint('best_model.h5', save_best_only=True, monitor='val_loss', mode='min', verbose=1)
 
+    # 添加断训检查点回调
+    checkpoint_dir = 'checkpoint'
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=checkpoint_dir + "/model_checkpoint-{epoch}", 
+        save_weights_only=True,
+        save_freq='epoch',  # 每个 epoch 保存一次
+        verbose=1
+    )
+
+    # # 进行超参数调优
+    # logger.info("开始超参数调优...")
+    # tuner.search(X_train, y_train, epochs=epochs, batch_size=batch_size, 
+    #             validation_data=(X_val, y_val), class_weight=class_weight_dict, 
+    #             callbacks=[lr_scheduler, early_stopping, checkpoint, checkpoint_callback])
+
     # 进行超参数调优
     logger.info("开始超参数调优...")
-    tuner.search(X_train, y_train, epochs=epochs, batch_size=batch_size, 
-                validation_data=(X_val, y_val), class_weight=class_weight_dict, 
-                callbacks=[lr_scheduler, early_stopping, checkpoint])
+    try:
+        tuner.search(X_train, y_train, epochs=epochs, batch_size=batch_size, 
+                     validation_data=(X_val, y_val), class_weight=class_weight_dict, 
+                     callbacks=[lr_scheduler, early_stopping, checkpoint, checkpoint_callback])
+
+        # 检查是否有最佳模型
+        best_trials = tuner.oracle.get_best_trials(num_trials=1)
+        if not best_trials:
+            raise ValueError("未找到最佳试验，超参数调优可能未能正常完成。")
+        
+        # 获取最佳模型
+        best_hp = best_trials[0].hyperparameters
+        best_model = build_model_partial(best_hp)  # 使用最佳超参数组合来构建模型
+        
+        logger.info("最优模型训练完成")
+    
+    except Exception as e:
+        logger.error(f"超参数调优或模型训练失败：{e}")
+        # 可以返回一个默认模型或执行回退操作
+        best_model = None
+
     
     # 获取最佳模型
     best_model = tuner.get_best_models(num_models=1)[0]
     logger.info("最优模型训练完成")
+
+    # 保存最终模型
+    best_model.save('final_model.h5')
     
     return best_model
 

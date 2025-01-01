@@ -34,3 +34,5 @@ build/
 
 # 临时忽略
 *.csv
+预测/checkpoint/
+预测/my_dir/
