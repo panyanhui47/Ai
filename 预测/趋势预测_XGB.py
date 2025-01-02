@@ -23,10 +23,11 @@ from collections import Counter
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Input, Dropout, Bidirectional
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ReduceLROnPlateau, TerminateOnNaN, EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import ReduceLROnPlateau, TerminateOnNaN, EarlyStopping, ModelCheckpoint, Callback
 import tensorflow as tf
 import logging
 import tensorflow.keras.backend as K
+from tensorflow.keras.metrics import Precision, Recall
 import keras_tuner as kt
 from functools import partial
 
@@ -421,6 +422,127 @@ def create_data_generator(X, y, batch_size=32):
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)  # 自动优化数据加载
     return dataset
 
+# 精确率计算
+def precision(y_true, y_pred):
+    y_true = K.cast(y_true, 'int32')
+    y_pred = K.cast(K.argmax(y_pred, axis=-1), 'int32')  # 获取最大概率的类别
+    true_positives = K.sum(K.cast(y_true * y_pred, 'float32'))
+    predicted_positives = K.sum(K.cast(y_pred, 'float32'))
+    precision = true_positives / (predicted_positives + K.epsilon())
+    return precision
+
+# 召回率计算
+def recall(y_true, y_pred):
+    y_true = K.cast(y_true, 'int32')
+    y_pred = K.cast(K.argmax(y_pred, axis=-1), 'int32')  # 获取最大概率的类别
+    true_positives = K.sum(K.cast(y_true * y_pred, 'float32'))
+    possible_positives = K.sum(K.cast(y_true, 'float32'))
+    recall = true_positives / (possible_positives + K.epsilon())
+    return recall
+
+# F1 分数计算
+def f1_score(y_true, y_pred):
+    p = precision(y_true, y_pred)
+    r = recall(y_true, y_pred)
+    return 2 * (p * r) / (p + r + K.epsilon())
+
+# 为每个类别计算精确率、召回率、F1 分数
+def class_metrics(y_true, y_pred, class_weight=None, num_classes=3):
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    weighted_precision_scores = []
+    weighted_recall_scores = []
+    weighted_f1_scores = []
+
+    for i in range(num_classes):
+        # 每个类别的真实标签
+        true_class = K.cast(K.equal(y_true, i), 'float32')
+        # 预测为当前类别的标签
+        predicted_class = K.cast(K.equal(K.argmax(y_pred, axis=-1), i), 'float32')
+        
+        # 计算精确率、召回率和F1分数
+        precision_class = K.sum(true_class * predicted_class) / (K.sum(predicted_class) + K.epsilon())
+        recall_class = K.sum(true_class * predicted_class) / (K.sum(true_class) + K.epsilon())
+        f1_class = 2 * precision_class * recall_class / (precision_class + recall_class + K.epsilon())
+        
+        precision_scores.append(precision_class)
+        recall_scores.append(recall_class)
+        f1_scores.append(f1_class)
+
+        # 如果提供了 class_weight，根据权重调整每个类的精确率、召回率和 F1 分数
+        if class_weight is not None:
+            weight = class_weight.get(i, 1.0)  # 默认权重为 1.0
+            weighted_precision_scores.append(precision_class * weight)
+            weighted_recall_scores.append(recall_class * weight)
+            weighted_f1_scores.append(f1_class * weight)
+        else:
+            weighted_precision_scores.append(precision_class)
+            weighted_recall_scores.append(recall_class)
+            weighted_f1_scores.append(f1_class)
+            
+        # 打印每个类的值
+        logger.info(f"标签 {i}: 精确率 = {precision_class.numpy()}, 召回率 = {recall_class.numpy()}, F1 分数 = {f1_class.numpy()}")
+
+    # 计算宏平均（Macro Average）
+    macro_precision = K.mean(K.stack(precision_scores))
+    macro_recall = K.mean(K.stack(recall_scores))
+    macro_f1 = K.mean(K.stack(f1_scores))
+
+    # 计算加权平均（Weighted Average）
+    total_samples = K.sum(K.cast(K.not_equal(y_true, -1), 'float32'))
+
+    # Expand dims to ensure shapes are compatible for multiplication and division
+    precision_scores_exp = K.expand_dims(K.stack(precision_scores), axis=-1)
+    recall_scores_exp = K.expand_dims(K.stack(recall_scores), axis=-1)
+    f1_scores_exp = K.expand_dims(K.stack(f1_scores), axis=-1)
+
+    print(f"y_true shape: {y_true.shape}")
+    print(f"precision_scores shape: {K.stack(precision_scores).shape}")
+    print(f"recall_scores shape: {K.stack(recall_scores).shape}")
+    print(f"f1_scores shape: {K.stack(f1_scores).shape}")
+    
+    weighted_precision = K.sum(precision_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
+    weighted_recall = K.sum(recall_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
+    weighted_f1 = K.sum(f1_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
+
+    return {
+        'macro_precision': macro_precision,
+        'macro_recall': macro_recall,
+        'macro_f1': macro_f1,
+        'weighted_precision': weighted_precision,
+        'weighted_recall': weighted_recall,
+        'weighted_f1': weighted_f1
+    }
+
+# 自定义回调类来计算每个 epoch 的 class_metrics
+class ClassMetricsCallback(Callback):
+    def __init__(self, val_data=None, class_weight=None):
+        super().__init__()
+        self.val_data = val_data  # 显示传入的验证数据
+        self.class_weight = class_weight # 显示传入权重字典
+
+    def on_epoch_end(self, epoch, logs=None):
+        # 获取模型的预测值
+        if self.val_data:
+            X_val, y_val = self.val_data  # 获取验证数据
+            y_pred = self.model.predict(X_val)  # 使用验证数据进行预测
+            y_true = y_val
+        else:
+            # 如果验证数据不可用，抛出异常并退出
+            raise ValueError(f"验证数据不可用 for epoch {epoch + 1}. Training stopped.")
+        # 计算指标
+        metrics = class_metrics(y_true, y_pred, class_weight=self.class_weight)
+        
+        # 打印每个类的宏平均和加权平均指标
+        logger.info(f"Epoch {epoch}:")
+        logger.info(f"宏精确率: {metrics['macro_precision']}")
+        logger.info(f"宏召回率: {metrics['macro_recall']}")
+        logger.info(f"宏F1分数: {metrics['macro_f1']}")
+        logger.info(f"加权精确率: {metrics['weighted_precision']}")
+        logger.info(f"加权召回率: {metrics['weighted_recall']}")
+        logger.info(f"加权F1分数: {metrics['weighted_f1']}")
+
 def build_model(hp, X, window_size):
     """
     构建并返回LSTM模型，包含超参数调优
@@ -436,7 +558,6 @@ def build_model(hp, X, window_size):
     # 第一个Bidirectional LSTM层，超参数调优
     model.add(Bidirectional(LSTM(
         units=hp.Int('units', min_value=32, max_value=128, step=32),
-        # activation=hp.Choice('activation', values=['tanh', 'relu']),
         activation='tanh',
         return_sequences=True
     )))
@@ -445,7 +566,6 @@ def build_model(hp, X, window_size):
     # 第二个Bidirectional LSTM层，超参数调优
     model.add(Bidirectional(LSTM(
         units=hp.Int('units_2', min_value=32, max_value=128, step=32),
-        # activation=hp.Choice('activation_2', values=['tanh', 'relu']),
         activation='tanh',
         return_sequences=False
     )))
@@ -462,7 +582,9 @@ def build_model(hp, X, window_size):
 
     # 编译模型，使用Adam优化器，并调节学习率
     optimizer = Adam(learning_rate=hp.Float('learning_rate', min_value=1e-5, max_value=1e-2, sampling='log'))
-    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=optimizer, 
+                    loss='sparse_categorical_crossentropy', # 用于多分类问题
+                    metrics=['accuracy'])
 
     return model
 
@@ -499,7 +621,12 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
 
     # 计算类别权重，处理类别不平衡
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+    
+    # 打印每个类的权重
+    logger.info(f"每个标签的权重:, {class_weights}")
     class_weight_dict = dict(enumerate(class_weights))
+    logger.info(f"权重字典:, {class_weight_dict}")
+
 
     # 创建数据生成器（如果需要）
     # dataset = create_data_generator(X_train, y_train, batch_size)
@@ -537,9 +664,19 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
     # 进行超参数调优
     logger.info("开始超参数调优...")
     try:
-        tuner.search(X_train, y_train, epochs=epochs, batch_size=batch_size, 
-                     validation_data=(X_val, y_val), class_weight=class_weight_dict, 
-                     callbacks=[lr_scheduler, early_stopping, checkpoint, checkpoint_callback])
+        tuner.search(X_train, y_train, 
+                    epochs=epochs, 
+                    batch_size=batch_size, 
+                    validation_data=(X_val, y_val), 
+                    class_weight=class_weight_dict, 
+                    callbacks=[ClassMetricsCallback(val_data=(X_val, y_val),
+                                                    class_weight=class_weight_dict),
+                                lr_scheduler, 
+                                early_stopping, 
+                                checkpoint, 
+                                checkpoint_callback
+                                ]
+                    )
 
         # 检查是否有最佳模型
         best_trials = tuner.oracle.get_best_trials(num_trials=1)
@@ -611,17 +748,6 @@ def comprehensive_analysis(df, model):
     print(f"MA Signal: {ma_signal}")
     print(f"RSI Signal: {rsi_signal}")
     print(f"Suggested Action: {suggestion}")
-
-    # 可视化
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(df['Close'], label='Close Price')
-    # plt.plot(df['MA50'], label='50-Day MA')
-    # plt.plot(df['MA200'], label='200-Day MA')
-    # plt.title('ETH/USD Price and Moving Averages')
-    # plt.legend()
-    # plt.show()
-
-
 
 def backtest_model(model, df, initial_balance=10000, transaction_fee=0.001):
     """
@@ -857,7 +983,8 @@ if __name__ == "__main__":
     symbol = 'ETH/USDT'
     timeframe = '1m'  # 时间框架 (如 '1m', '5m', '1h', '1d')
     days = 30  # 数据跨度 (天)
-    save_path = 'ETH_USDT_1m_binance_data.csv'
+    # save_path = 'ETH_USDT_1m_binance_data.csv'
+    save_path = 'binance_data.csv'
 
     # 获取数据
     df = get_binance_data(symbol,timeframe,days,save_path)
