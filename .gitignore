@@ -26,7 +26,6 @@ __pycache__/
 
 # 忽略忽略虚拟环境
 venv/
-*/venv/
 
 # 忽略 特定 目录
 build/
@@ -34,3 +33,5 @@ build/
 
 # 临时忽略
 *.csv
+checkpoint/
+my_dir/

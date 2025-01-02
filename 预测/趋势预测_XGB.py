@@ -534,12 +534,6 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
         verbose=1
     )
 
-    # # 进行超参数调优
-    # logger.info("开始超参数调优...")
-    # tuner.search(X_train, y_train, epochs=epochs, batch_size=batch_size, 
-    #             validation_data=(X_val, y_val), class_weight=class_weight_dict, 
-    #             callbacks=[lr_scheduler, early_stopping, checkpoint, checkpoint_callback])
-
     # 进行超参数调优
     logger.info("开始超参数调优...")
     try:
