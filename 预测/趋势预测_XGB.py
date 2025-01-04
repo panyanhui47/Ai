@@ -31,6 +31,8 @@ from tensorflow.keras.metrics import Precision, Recall
 import keras_tuner as kt
 from functools import partial
 
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+
 K.clear_session()  # 清理 Keras 会话，释放 GPU 内存
 
 # 设置日志配置
@@ -271,9 +273,9 @@ def generate_labels_and_features(df, window_size=20, train_ratio=0.8):
     :param train_ratio: 训练集的比例（默认80%训练，20%验证）
     :return: 训练集特征、训练集标签、验证集特征和验证集标签
     """
-    # 计算价格变化并生成标签
+    # # 计算价格变化并生成标签
     df['PriceChange'] = df['Close'].pct_change(1)  # 计算当前时间步和前一个时间步的价格变化（百分比变化）
-    df['Label'] = np.where(df['PriceChange'] > 0.001, 1, np.where(df['PriceChange'] < -0.001, 2, 0))  # 保持 1, 0, 2
+    # df['Label'] = np.where(df['PriceChange'] > 0.001, 1, np.where(df['PriceChange'] < -0.001, 2, 0))  # 保持 1, 0, 2
     
     # 检查 PriceChange 中的 NaN
     logger.info(f"PriceChange 列中 NaN 值的数量: {df['PriceChange'].isna().sum()}")
@@ -291,13 +293,13 @@ def generate_labels_and_features(df, window_size=20, train_ratio=0.8):
     nan_rows = df[df.isna().any(axis=1)]
     logger.info(f"筛选出包含 NaN 值的行: {nan_rows}")
     # nan_rows.to_csv('nan_rows.csv') # 如果需要可以保存 NaN 行
-
+    logger.info(f"df数据的头几行:\n{df.head()}")
+    logger.info(f"df数据的尾几行:\n{df.tail()}")
     # 过滤掉无关列
     features = df.drop(columns=['Label', 'PriceChange'], errors='ignore')  # 确保去掉无关列
 
     logger.info(f"特征数据的头几行:\n{features.head()}")
     logger.info(f"特征数据的尾几行:\n{features.tail()}")
-    
     logger.info(f"特征数据的NaN数量: {np.sum(np.isnan(features.values))}")
 
     # =================================================================================
@@ -447,72 +449,71 @@ def f1_score(y_true, y_pred):
     return 2 * (p * r) / (p + r + K.epsilon())
 
 # 为每个类别计算精确率、召回率、F1 分数
-def class_metrics(y_true, y_pred, class_weight=None, num_classes=3):
+def class_metrics(y_true, y_pred, class_weight=None, num_classes=2):
+    """
+    计算分类的精确率、召回率和 F1 分数（宏平均和加权平均）。
+    :param y_true: 真实标签，形状为 (batch_size, )，整数编码
+    :param y_pred: 模型预测的概率分布，形状为 (batch_size, num_classes)
+    :param class_weight: 类别权重的字典，形如 {0: weight_0, 1: weight_1, ...}
+    :param num_classes: 类别数量
+    :return: 一个字典，包含宏平均和加权平均的精确率、召回率和 F1 分数
+    """
     precision_scores = []
     recall_scores = []
     f1_scores = []
-    weighted_precision_scores = []
-    weighted_recall_scores = []
-    weighted_f1_scores = []
+
+    # 计算类别分布（如果提供了 class_weight）
+    label_counts = K.sum(K.one_hot(y_true, num_classes), axis=0)
+    total_labels = K.sum(label_counts)
+    weights = (
+        [class_weight.get(i, 1.0) for i in range(num_classes)]
+        if class_weight is not None
+        else [1.0] * num_classes
+    )
 
     for i in range(num_classes):
-        # 每个类别的真实标签
-        true_class = K.cast(K.equal(y_true, i), 'float32')
-        # 预测为当前类别的标签
-        predicted_class = K.cast(K.equal(K.argmax(y_pred, axis=-1), i), 'float32')
-        
-        # 计算精确率、召回率和F1分数
+        # 当前类别的真实标签和预测标签
+        true_class = K.cast(K.equal(y_true, i), "float32")
+        predicted_class = K.cast(K.equal(K.argmax(y_pred, axis=-1), i), "float32")
+
+        # 计算精确率、召回率和 F1 分数
         precision_class = K.sum(true_class * predicted_class) / (K.sum(predicted_class) + K.epsilon())
         recall_class = K.sum(true_class * predicted_class) / (K.sum(true_class) + K.epsilon())
         f1_class = 2 * precision_class * recall_class / (precision_class + recall_class + K.epsilon())
-        
+
         precision_scores.append(precision_class)
         recall_scores.append(recall_class)
         f1_scores.append(f1_class)
 
-        # 如果提供了 class_weight，根据权重调整每个类的精确率、召回率和 F1 分数
-        if class_weight is not None:
-            weight = class_weight.get(i, 1.0)  # 默认权重为 1.0
-            weighted_precision_scores.append(precision_class * weight)
-            weighted_recall_scores.append(recall_class * weight)
-            weighted_f1_scores.append(f1_class * weight)
-        else:
-            weighted_precision_scores.append(precision_class)
-            weighted_recall_scores.append(recall_class)
-            weighted_f1_scores.append(f1_class)
-            
-        # 打印每个类的值
-        logger.info(f"标签 {i}: 精确率 = {precision_class.numpy()}, 召回率 = {recall_class.numpy()}, F1 分数 = {f1_class.numpy()}")
+        # 打印每个类别的指标
+        logger.info(
+            f"标签 {i}: 精确率 = {precision_class.numpy():.4f}, 召回率 = {recall_class.numpy():.4f}, F1 分数 = {f1_class.numpy():.4f}"
+        )
 
-    # 计算宏平均（Macro Average）
+    # 计算宏平均
     macro_precision = K.mean(K.stack(precision_scores))
     macro_recall = K.mean(K.stack(recall_scores))
     macro_f1 = K.mean(K.stack(f1_scores))
 
-    # 计算加权平均（Weighted Average）
-    total_samples = K.sum(K.cast(K.not_equal(y_true, -1), 'float32'))
+    # 计算加权平均
+    weighted_precision = K.sum(
+        K.stack(precision_scores) * (label_counts / total_labels)
+    )
+    weighted_recall = K.sum(
+        K.stack(recall_scores) * (label_counts / total_labels)
+    )
+    weighted_f1 = K.sum(
+        K.stack(f1_scores) * (label_counts / total_labels)
+    )
 
-    # Expand dims to ensure shapes are compatible for multiplication and division
-    precision_scores_exp = K.expand_dims(K.stack(precision_scores), axis=-1)
-    recall_scores_exp = K.expand_dims(K.stack(recall_scores), axis=-1)
-    f1_scores_exp = K.expand_dims(K.stack(f1_scores), axis=-1)
-
-    print(f"y_true shape: {y_true.shape}")
-    print(f"precision_scores shape: {K.stack(precision_scores).shape}")
-    print(f"recall_scores shape: {K.stack(recall_scores).shape}")
-    print(f"f1_scores shape: {K.stack(f1_scores).shape}")
-    
-    weighted_precision = K.sum(precision_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
-    weighted_recall = K.sum(recall_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
-    weighted_f1 = K.sum(f1_scores_exp * K.cast(K.not_equal(y_true, -1), 'float32')) / total_samples
-
+    # 返回结果字典
     return {
-        'macro_precision': macro_precision,
-        'macro_recall': macro_recall,
-        'macro_f1': macro_f1,
-        'weighted_precision': weighted_precision,
-        'weighted_recall': weighted_recall,
-        'weighted_f1': weighted_f1
+        "macro_precision": macro_precision.numpy(),
+        "macro_recall": macro_recall.numpy(),
+        "macro_f1": macro_f1.numpy(),
+        "weighted_precision": weighted_precision.numpy(),
+        "weighted_recall": weighted_recall.numpy(),
+        "weighted_f1": weighted_f1.numpy(),
     }
 
 # 自定义回调类来计算每个 epoch 的 class_metrics
@@ -543,7 +544,52 @@ class ClassMetricsCallback(Callback):
         logger.info(f"加权召回率: {metrics['weighted_recall']}")
         logger.info(f"加权F1分数: {metrics['weighted_f1']}")
 
-def build_model(hp, X, window_size):
+# 损失函数focal_loss
+def focal_loss_with_class_weight(gamma=2., alpha=0.25, class_weight=None):
+    """
+    Focal Loss with class weighting for multi-class classification.
+    :param gamma: focusing parameter, usually set to 2
+    :param alpha: balancing factor, typically between 0 and 1
+    :param class_weight: dictionary containing class weights, e.g. {0: 0.389, 1: 4.6, 2: 4.6}
+    :return: loss function
+    """
+    def focal_loss_fixed(y_true, y_pred):
+        print('y_true shape:', y_true.shape)
+        print('y_pred shape:', y_pred.shape)
+
+        # Ensure y_true is float32 to match y_pred's type
+        y_true = K.cast(y_true, dtype='float32')  # Ensure y_true is float32
+        
+        # Clip predictions to prevent log(0)
+        y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
+        
+        # Calculate cross entropy
+        cross_entropy = -y_true * K.log(y_pred)
+        
+        # Apply class weight
+        if class_weight is not None:
+            # Convert class_weight dict to tensor (shape: [num_classes])
+            class_weight_tensor = tf.constant([class_weight.get(i, 1.0) for i in range(len(class_weight))], dtype=tf.float32)
+            
+            # For each sample, get the class index (using argmax) and the corresponding weight
+            sample_weights = K.gather(class_weight_tensor, K.argmax(y_true, axis=-1))  # Shape: (batch_size,)
+            sample_weights = K.expand_dims(sample_weights, axis=-1)  # Expand to shape (batch_size, 1) to match y_true's shape
+        else:
+            sample_weights = 1.0  # Default, no class weight applied
+            sample_weights = K.expand_dims(sample_weights, axis=-1)  # Expand to shape (batch_size, 1)
+        
+        # Calculate the loss with focal term
+        focal_loss = K.pow(1 - y_pred, gamma) * cross_entropy
+        
+        # Apply the sample weight to the focal loss
+        weighted_loss = sample_weights * focal_loss
+        
+        return K.sum(weighted_loss, axis=-1)  # Sum over the classes (for each sample)
+
+    return focal_loss_fixed
+
+
+def build_model(hp, X, window_size, class_weight=None):
     """
     构建并返回LSTM模型，包含超参数调优
     :param hp: KerasTuner的超参数对象
@@ -582,8 +628,17 @@ def build_model(hp, X, window_size):
 
     # 编译模型，使用Adam优化器，并调节学习率
     optimizer = Adam(learning_rate=hp.Float('learning_rate', min_value=1e-5, max_value=1e-2, sampling='log'))
+
+    # 使用 Focal Loss with Class Weight 作为损失函数
+    # loss_fn = focal_loss_with_class_weight(
+    #     gamma=hp.Float('gamma', min_value=1.0, max_value=5.0, step=0.1),
+    #     alpha=hp.Float('alpha', min_value=0.1, max_value=0.8, step=0.1),
+    #     class_weight=class_weight
+    # )
+
     model.compile(optimizer=optimizer, 
                     loss='sparse_categorical_crossentropy', # 用于多分类问题
+                    # loss=loss_fn,
                     metrics=['accuracy'])
 
     return model
@@ -625,14 +680,17 @@ def train_model_with_tuning(df, window_size=20, train_ratio=0.8, epochs=5000, ba
     # 打印每个类的权重
     logger.info(f"每个标签的权重:, {class_weights}")
     class_weight_dict = dict(enumerate(class_weights))
+
+    # class_weight_dict[0] = 0.0  # 将标签为0的权重设为0，表示忽略这些样本
     logger.info(f"权重字典:, {class_weight_dict}")
-
-
+    
     # 创建数据生成器（如果需要）
     # dataset = create_data_generator(X_train, y_train, batch_size)
 
     # 使用 `partial` 来传递 `X_train` 和 `window_size` 到 `build_model`
-    build_model_partial = partial(build_model, X=X_train, window_size=window_size)
+    build_model_partial = partial(build_model, X=X_train, 
+                                    window_size=window_size, 
+                                    class_weight=class_weight_dict)
 
     # 使用KerasTuner进行调参
     tuner = kt.Hyperband(
@@ -983,11 +1041,13 @@ if __name__ == "__main__":
     symbol = 'ETH/USDT'
     timeframe = '1m'  # 时间框架 (如 '1m', '5m', '1h', '1d')
     days = 30  # 数据跨度 (天)
-    # save_path = 'ETH_USDT_1m_binance_data.csv'
-    save_path = 'binance_data.csv'
+    save_path = 'ETH_USDT_1m_binance_data.csv'
+    # save_path = 'binance_data.csv'
 
     # 获取数据
-    df = get_binance_data(symbol,timeframe,days,save_path)
+    # df = get_binance_data(symbol,timeframe,days,save_path)
+    df = pd.read_csv("labeled_kline_data.csv")
+    df.set_index('timestamp', inplace=True)
 
     
     # 计算技术指标
